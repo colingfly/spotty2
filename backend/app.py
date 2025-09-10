@@ -22,6 +22,8 @@ from config import settings
 from db import SessionLocal
 from models import SpotifyAccount
 
+from sqlalchemy import text
+
 # ---------- Logging ----------
 log = logging.getLogger("spotty")
 logging.basicConfig(level=logging.INFO)
@@ -196,10 +198,11 @@ def create_app() -> Flask:
     def ready():
         try:
             db = next(_get_db())
-            db.execute("SELECT 1")
+            db.execute(text("SELECT 1"))
             return {"ok": True}
         except Exception as e:
             return {"ok": False, "error": str(e)}, 500
+
 
     @app.get("/login")
     def login():
