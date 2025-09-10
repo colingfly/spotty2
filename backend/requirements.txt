@@ -1,0 +1,27 @@
+# Core web framework
+Flask==3.0.3
+Flask-Cors==4.0.1
+
+# Env var management
+python-dotenv==1.0.1
+
+# Database ORM
+SQLAlchemy==2.0.35
+
+# MySQL driver (pymysql works well with SQLAlchemy)
+pymysql==1.1.1
+
+# Requests for HTTP calls (Spotify API)
+requests==2.32.3
+
+# Optional: for token refresh + security
+cryptography==43.0.1
+
+# OCR + CV + fuzzy
+pillow==10.4.0
+pytesseract==0.3.13
+opencv-python-headless==4.10.0.84
+rapidfuzz==3.9.6
+numpy==1.26.4
+psycopg[binary]==3.2.10
+
