@@ -1,23 +1,14 @@
-# db.py
-import os
+# backend/db.py
 from sqlalchemy import create_engine
-from sqlalchemy.orm import declarative_base, sessionmaker
-from dotenv import load_dotenv
-
-load_dotenv()
-
-DATABASE_URL = os.getenv("DATABASE_URL")
-
-# Force psycopg3
-if DATABASE_URL.startswith("postgresql://"):
-    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
+from sqlalchemy.orm import sessionmaker, declarative_base
+from config import settings
 
 engine = create_engine(
-    DATABASE_URL,
-    echo=True,
-    future=True
+    settings.database_url,
+    pool_pre_ping=True,
+    pool_size=5,
+    max_overflow=5,
+    future=True,
 )
-
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine, future=True)
 Base = declarative_base()
-
