@@ -1,0 +1,12 @@
+# Ignore environment files
+.env
+backend/.env
+frontend/.env
+
+# Other common ignores
+__pycache__/
+node_modules/
+*.pyc
+ 
+
+ 
