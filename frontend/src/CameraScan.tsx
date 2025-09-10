@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { BACKEND_URL } from "./config";
+import { API_BASE } from "./config";
 
 type Props = {
   spotifyUserId: string;
@@ -80,7 +80,7 @@ export default function CameraScan({ spotifyUserId, onResults }: Props) {
       form.append("spotify_user_id", spotifyUserId);
       form.append("file", blob, "capture.jpg");
 
-      const res = await fetch(`${BACKEND_URL}/api/scan`, {
+      const res = await fetch(`${ API_BASE }/api/scan`, {
         method: "POST",
         body: form,
       });

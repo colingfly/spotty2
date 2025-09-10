@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { BACKEND_URL } from "./config";
+import { API_BASE } from "./config";
 import CameraScan from "./CameraScan";
 
 type Artist = {
@@ -47,7 +47,7 @@ export default function App() {
   const [file, setFile] = useState<File | null>(null);
   const [showCamera, setShowCamera] = useState(false);
 
-  const loginUrl = useMemo(() => `${BACKEND_URL}/login`, []);
+  const loginUrl = useMemo(() => `${API_BASE}/login`, []);
 
   const fetchArtists = async () => {
     if (!sid) {
@@ -57,7 +57,7 @@ export default function App() {
     setLoading(true);
     setError(null);
 
-    const url = `${BACKEND_URL}/api/me/top-artists?spotify_user_id=${encodeURIComponent(
+    const url = `${API_BASE}/api/me/top-artists?spotify_user_id=${encodeURIComponent(
       sid
     )}&time_range=${timeRange}&limit=24`;
 
@@ -82,7 +82,7 @@ export default function App() {
     form.append("spotify_user_id", sid);
     form.append("file", file);
 
-    const res = await fetch(`${BACKEND_URL}/api/scan`, { method: "POST", body: form });
+    const res = await fetch(`${API_BASE}/api/scan`, { method: "POST", body: form });
     const data = await res.json();
     if (!res.ok) {
       alert(data?.message || "Scan failed");
