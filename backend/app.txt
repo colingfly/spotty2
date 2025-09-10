@@ -1,4 +1,6 @@
 tesseract-ocr
 tesseract-ocr-eng
-libglib2.0-0
+libtesseract-dev
 libgl1
+libglib2.0-0
+
