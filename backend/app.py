@@ -1,6 +1,6 @@
 # backend/app.py
 from __future__ import annotations
-import io, os, time, base64, logging
+import io, os, time, base64, logging, math
 from urllib.parse import urlencode
 from typing import Generator
 
@@ -8,7 +8,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from flask import Flask, request, jsonify, redirect
+from flask import Flask, request, redirect
 from flask_cors import CORS
 from werkzeug.middleware.proxy_fix import ProxyFix
 
@@ -17,16 +17,17 @@ import numpy as np
 import cv2
 import pytesseract
 from rapidfuzz import fuzz
-
-from sqlalchemy import text as sqltext
+from sqlalchemy import text as sql_text
 
 from config import settings
 from db import SessionLocal
-from models import SpotifyAccount
+from models import SpotifyAccount, UserTaste, PosterScan, ArtistEdge
+
 
 # ---------- Logging ----------
 log = logging.getLogger("spotty")
 logging.basicConfig(level=logging.INFO)
+
 
 # ---------- HTTP client with retries ----------
 def _spotify_session() -> requests.Session:
@@ -38,20 +39,24 @@ def _spotify_session() -> requests.Session:
         allowed_methods=("GET", "POST"),
     )
     s.mount("https://", HTTPAdapter(max_retries=retry))
-    s.timeout = 15
     return s
+
 
 AUTH_URL = "https://accounts.spotify.com/authorize"
 TOKEN_URL = "https://accounts.spotify.com/api/token"
 API_BASE  = "https://api.spotify.com/v1"
 
+AUDIO_KEYS = [
+    "danceability","energy","valence","acousticness",
+    "instrumentalness","liveness","speechiness","tempo"
+]
+
+
 def create_app() -> Flask:
     app = Flask(__name__)
-    app.wsgi_app = ProxyFix(app.wsgi_app)  # Render/Heroku friendly
+    app.wsgi_app = ProxyFix(app.wsgi_app)  # proxy friendly (Render/Heroku)
     app.config["SECRET_KEY"] = settings.secret_key
     app.config["MAX_CONTENT_LENGTH"] = settings.max_upload_mb * 1024 * 1024  # upload cap
-
-    # CORS
     CORS(app, resources={r"/api/*": {"origins": settings.cors_origins}}, supports_credentials=False)
 
     # Optional local Windows path for Tesseract
@@ -85,6 +90,7 @@ def create_app() -> Flask:
                 "refresh_token": acct.refresh_token,
                 "redirect_uri": settings.spotify_redirect_uri,
             },
+            timeout=15
         )
         if r.status_code != 200:
             raise RuntimeError(f"Refresh failed: {r.status_code} {r.text}")
@@ -116,33 +122,23 @@ def create_app() -> Flask:
             # Tesseract not available on host, or runtime issue
             raise RuntimeError("OCR unavailable on this server") from e
 
-    # --- improved candidate extraction for venue calendars ---
     def _tokenize_candidate_lines(text: str) -> list[str]:
         raw = [ln.strip() for ln in text.splitlines()]
-
-        STOP = {
-            "get tickets","event date","event time","min ticket price","doors",
-            "show","wed","thu","fri","sat","sun","mon","tue",
-            "oct","nov","dec","pm","am","menu","calendar",
-            "featured events","private events","about us","home"
-        }
-
-        keep=[]
+        keep: list[str] = []
         for ln in raw:
-            if not ln:
+            if not ln or len(ln) < 2:
                 continue
-            low = ln.lower()
-            if any(s in low for s in STOP):
+            if any(ch.isdigit() for ch in ln) and len(ln) <= 4:
                 continue
             clean = "".join(ch for ch in ln if ch.isalnum() or ch.isspace() or ch in "&-.'")
-            clean = " ".join(clean.split())
-            tokens = clean.split()
-            if 1 <= len(tokens) <= 5 and any(c.isalpha() for c in clean):
-                keep.append(clean)
-
-        seen=set(); out=[]
+            words = clean.split()
+            if len(words) > 7:
+                continue
+            keep.append(clean.strip())
+        # de-dupe (case-insensitive)
+        seen = set(); out=[]
         for k in keep:
-            low=k.lower()
+            low = k.lower()
             if low not in seen:
                 seen.add(low); out.append(k)
         return out
@@ -154,111 +150,150 @@ def create_app() -> Flask:
         union = len(a | b)
         return inter / union if union else 0.0
 
+    # ---------- music-expert helpers ----------
+    def _get_user_taste(acct: SpotifyAccount, db) -> dict:
+        """
+        Cache & return user's taste vector and genre set.
+        Vector = average of top tracks' audio features (long_term).
+        """
+        now = int(time.time())
+        ut = db.query(UserTaste).filter_by(spotify_user_id=acct.spotify_user_id).one_or_none()
+        # refresh every 24h
+        if not ut or now - (ut.updated_at or 0) > 86400:
+            sess = _spotify_session()
+            r = sess.get(
+                f"{API_BASE}/me/top/tracks",
+                headers={"Authorization": f"Bearer {acct.access_token}"},
+                params={"time_range": "long_term", "limit": 50},
+                timeout=15,
+            )
+            tracks = r.json().get("items", []) if r.ok else []
+            ids = [t["id"] for t in tracks if t.get("id")]
+
+            af = {}
+            if ids:
+                rr = sess.get(
+                    f"{API_BASE}/audio-features",
+                    headers={"Authorization": f"Bearer {acct.access_token}"},
+                    params={"ids": ",".join(ids[:100])},
+                    timeout=15,
+                )
+                if rr.ok:
+                    af = {x["id"]: x for x in rr.json().get("audio_features", []) if x}
+
+            vec = {k: 0.0 for k in AUDIO_KEYS}
+            n = 0
+            for tid in ids:
+                f = af.get(tid)
+                if not f: continue
+                for k in AUDIO_KEYS:
+                    vec[k] += float(f.get(k, 0.0))
+                n += 1
+            if n:
+                for k in AUDIO_KEYS: vec[k] /= n
+
+            # union genres from artists on those tracks
+            genres = set()
+            for t in tracks:
+                for a in t.get("artists", []):
+                    ar = sess.get(
+                        f"{API_BASE}/artists/{a['id']}",
+                        headers={"Authorization": f"Bearer {acct.access_token}"},
+                        timeout=15,
+                    )
+                    if ar.ok:
+                        for g in (ar.json().get("genres") or []):
+                            genres.add(g.lower())
+
+            if not ut:
+                ut = UserTaste(spotify_user_id=acct.spotify_user_id)
+            ut.updated_at = now
+            for k,v in vec.items(): setattr(ut, k, v)
+            ut.genres = ",".join(sorted(genres))
+            db.add(ut); db.commit(); db.refresh(ut)
+
+        vec = {k: getattr(ut, k) or 0.0 for k in AUDIO_KEYS}
+        genres = set((ut.genres or "").split(",")) if ut.genres else set()
+        return {"vec": vec, "genres": genres}
+
+    def _get_artist_audio_vec(artist_spotify_id: str, bearer: str) -> dict | None:
+        sess = _spotify_session()
+        r = sess.get(
+            f"{API_BASE}/artists/{artist_spotify_id}/top-tracks",
+            headers={"Authorization": f"Bearer {bearer}"},
+            params={"market": "US"},
+            timeout=15,
+        )
+        if not r.ok:
+            return None
+        tracks = r.json().get("tracks", [])
+        ids = [t["id"] for t in tracks if t.get("id")]
+        if not ids:
+            return None
+
+        rr = sess.get(
+            f"{API_BASE}/audio-features",
+            headers={"Authorization": f"Bearer {bearer}"},
+            params={"ids": ",".join(ids[:100])},
+            timeout=15,
+        )
+        if not rr.ok:
+            return None
+        feats = rr.json().get("audio_features", [])
+        if not feats:
+            return None
+
+        vec = {k: 0.0 for k in AUDIO_KEYS}
+        n = 0
+        for f in feats:
+            if not f: continue
+            for k in AUDIO_KEYS:
+                vec[k] += float(f.get(k, 0.0))
+            n += 1
+        if n:
+            for k in AUDIO_KEYS: vec[k] /= n
+        return vec
+
+    def _cosine(a: dict, b: dict) -> float:
+        num = 0.0; da = 0.0; db = 0.0
+        for k in AUDIO_KEYS:
+            x = float(a.get(k, 0.0)); y = float(b.get(k, 0.0))
+            num += x * y; da += x * x; db += y * y
+        if da <= 0 or db <= 0: return 0.0
+        return num / math.sqrt(da * db)
+
     def _spotify_search_artist(name: str, bearer: str) -> dict | None:
         sess = _spotify_session()
         r = sess.get(
             f"{API_BASE}/search",
             headers={"Authorization": f"Bearer {bearer}"},
             params={"q": name, "type": "artist", "limit": 3},
+            timeout=15,
         )
         if r.status_code != 200:
             return None
         items = (r.json().get("artists") or {}).get("items") or []
         return items[0] if items else None
 
-    def _get_user_top_genres(acct: SpotifyAccount) -> set[str]:
-        sess = _spotify_session()
-        r = sess.get(
-            f"{API_BASE}/me/top/artists",
-            headers={"Authorization": f"Bearer {acct.access_token}"},
-            params={"time_range": "long_term", "limit": 50},
-        )
-        if r.status_code != 200:
-            return set()
-        artists = r.json().get("items", [])
-        genres: set[str] = set()
-        for a in artists:
-            for g in a.get("genres", []):
-                genres.add(g.lower())
-        return genres
+    # --- co-occurrence helpers ---
+    def _stable_pair(a: str, b: str) -> tuple[str, str]:
+        a = a.lower().strip(); b = b.lower().strip()
+        return (a, b) if a <= b else (b, a)
 
-    # ====== Taste modeling helpers ======
-    def _cosine(a, b):
-        if not a or not b: return 0.0
-        num = sum(x*y for x, y in zip(a, b))
-        da  = (sum(x*x for x in a)) ** 0.5
-        db  = (sum(y*y for y in b)) ** 0.5
-        return (num / (da*db)) if da and db else 0.0
-
-    def _genre_jaccard(A: set[str], B: set[str]) -> float:
-        if not A or not B: return 0.0
-        inter = len(A & B); union = len(A | B)
-        return inter / union if union else 0.0
-
-    def _audio_vec_mean(features_list: list[dict]) -> list[float]:
-        if not features_list: return []
-        vecs=[]
-        for f in features_list:
-            if not f: continue
-            tempo = min(240.0, float(f.get("tempo", 0.0))) / 240.0
-            vecs.append([
-                float(f.get("danceability",0.0)),
-                float(f.get("energy",0.0)),
-                float(f.get("valence",0.0)),
-                float(f.get("acousticness",0.0)),
-                float(f.get("instrumentalness",0.0)),
-                float(f.get("liveness",0.0)),
-                float(f.get("speechiness",0.0)),
-                tempo
-            ])
-        if not vecs: return []
-        n=len(vecs)
-        return [sum(col)/n for col in zip(*vecs)]
-
-    def _artist_audio_vec(artist_id: str, sess: requests.Session, bearer: str) -> list[float]:
-        r = sess.get(
-            f"{API_BASE}/artists/{artist_id}/top-tracks",
-            headers={"Authorization": f"Bearer {bearer}"},
-            params={"market": "US"},
-        )
-        if r.status_code != 200:
-            return []
-        tracks = r.json().get("tracks", [])[:10]
-        if not tracks: return []
-        track_ids=",".join(t["id"] for t in tracks if t.get("id"))
-        r2 = sess.get(
-            f"{API_BASE}/audio-features",
-            headers={"Authorization": f"Bearer {bearer}"},
-            params={"ids": track_ids},
-        )
-        if r2.status_code != 200:
-            return []
-        feats = [f for f in r2.json().get("audio_features", []) if f]
-        return _audio_vec_mean(feats)
-
-    def _user_profile(acct: SpotifyAccount) -> dict:
-        sess = _spotify_session()
-        h  = {"Authorization": f"Bearer {acct.access_token}"}
-        rt = sess.get(f"{API_BASE}/me/top/artists", headers=h, params={"time_range":"long_term", "limit": 25})
-        if rt.status_code != 200:
-            rt = sess.get(f"{API_BASE}/me/top/artists", headers=h, params={"time_range":"medium_term", "limit": 25})
-        items = (rt.json() or {}).get("items", []) if rt.ok else []
-
-        all_genres: set[str] = set()
-        top_profiles = []
-        for a in items:
-            aid = a.get("id"); name = a.get("name"); genres = [g.lower() for g in a.get("genres",[])]
-            for g in genres: all_genres.add(g)
-            avec = _artist_audio_vec(aid, sess, acct.access_token) if aid else []
-            top_profiles.append({"id": aid, "name": name, "genres": set(genres), "audio_vec": avec})
-
-        vecs=[p["audio_vec"] for p in top_profiles if p["audio_vec"]]
-        user_vec = [sum(col)/len(vecs) for col in zip(*vecs)] if vecs else []
-
-        return {"audio_vec": user_vec, "genres": all_genres, "top_artists": top_profiles}
-
-    def _sim_audio_genre(A_vec, A_genres, B_vec, B_genres):
-        return 0.6 * _cosine(A_vec, B_vec) + 0.4 * _genre_jaccard(set(A_genres or []), set(B_genres or []))
+    def _update_cooccurrence(db, resolved_names: list[str]):
+        now = int(time.time())
+        names = [n.lower().strip() for n in resolved_names if n]
+        names = list(dict.fromkeys(names))  # unique
+        for i in range(len(names)):
+            for j in range(i + 1, len(names)):
+                a, b = _stable_pair(names[i], names[j])
+                edge = db.query(ArtistEdge).filter_by(a=a, b=b).one_or_none()
+                if not edge:
+                    edge = ArtistEdge(a=a, b=b, weight=0.0, last_seen=now)
+                edge.weight += 1.0
+                edge.last_seen = now
+                db.add(edge)
+        db.commit()
 
     # --------- Routes ----------
     @app.get("/")
@@ -273,7 +308,7 @@ def create_app() -> Flask:
     def ready():
         try:
             db = next(_get_db())
-            db.execute(sqltext("SELECT 1"))
+            db.execute(sql_text("SELECT 1"))
             return {"ok": True}
         except Exception as e:
             return {"ok": False, "error": str(e)}, 500
@@ -307,6 +342,7 @@ def create_app() -> Flask:
                 "code": code,
                 "redirect_uri": settings.spotify_redirect_uri,
             },
+            timeout=15,
         )
         if r.status_code != 200:
             return {"error": "token_exchange_failed", "body": r.text}, r.status_code
@@ -315,7 +351,7 @@ def create_app() -> Flask:
         refresh_token = tokens.get("refresh_token")
         expires_at = int(time.time()) + int(tokens.get("expires_in", 3600))
 
-        me = sess.get(f"{API_BASE}/me", headers={"Authorization": f"Bearer {access_token}"})
+        me = sess.get(f"{API_BASE}/me", headers={"Authorization": f"Bearer {access_token}"}, timeout=15)
         if me.status_code != 200:
             return {"error": "me_failed", "body": me.text}, me.status_code
         user = me.json()
@@ -368,6 +404,7 @@ def create_app() -> Flask:
             f"{API_BASE}/me/top/artists",
             headers={"Authorization": f"Bearer {acct.access_token}"},
             params={"time_range": time_range, "limit": limit},
+            timeout=20,
         )
         if r.status_code == 401:
             return {"error": "unauthorized"}, 401
@@ -389,7 +426,6 @@ def create_app() -> Flask:
 
     @app.post("/api/scan")
     def api_scan():
-        # Validate upload
         f = request.files.get("file")
         sid = request.form.get("spotify_user_id")
         if not f or not sid:
@@ -397,7 +433,6 @@ def create_app() -> Flask:
         if f.mimetype.split("/")[0] != "image":
             return {"error": "unsupported_media_type"}, 415
 
-        # get user + refresh token if needed
         db = next(_get_db())
         acct = db.query(SpotifyAccount).filter_by(spotify_user_id=sid).one_or_none()
         if not acct:
@@ -415,83 +450,96 @@ def create_app() -> Flask:
             return {"error": "ocr_unavailable", "message": str(ocr)}, 503
 
         candidates = _tokenize_candidate_lines(text)
-        user_genres = _get_user_top_genres(acct)
 
-        # first pass: resolve names to Spotify & compute name/genre confidence
+        # --- build "music-expert" scoring ---
+        user = _get_user_taste(acct, db)
+        user_vec = user["vec"]
+        user_genres = user["genres"]
+
+        results = []
         sess = _spotify_session()
-        base_results = []
+
         for cand in candidates:
             found = _spotify_search_artist(cand, acct.access_token)
             if not found:
                 continue
-            found_name = found["name"]
-            name_score = fuzz.token_set_ratio(cand.lower(), found_name.lower())  # 0..100
+
+            found_name = found["name"]; artist_id = found["id"]
+
+            # name (0..1)
+            name_score = fuzz.token_set_ratio(cand.lower(), found_name.lower()) / 100.0
+
+            # genre (0..1)
             artist_genres = set(g.lower() for g in found.get("genres", []))
-            genre_score = _jaccard(artist_genres, user_genres)                  # 0..1
-            total = 0.6 * (name_score / 100.0) + 0.4 * genre_score
-            base_results.append({
+            genre_score = _jaccard(artist_genres, user_genres)
+
+            # audio cosine (0..1)
+            avec = _get_artist_audio_vec(artist_id, acct.access_token) or {}
+            audio_score = _cosine(user_vec, avec)
+
+            # popularity prior (0..1)
+            pop = found.get("popularity", 0)
+            pop_score = float(pop) / 100.0
+
+            # co-occurrence boost (0..0.15)
+            boost = 0.0
+            try:
+                top_seen = db.query(ArtistEdge).filter(
+                    (ArtistEdge.a == found_name.lower()) | (ArtistEdge.b == found_name.lower())
+                ).order_by(ArtistEdge.weight.desc()).limit(1).one_or_none()
+                maxw = top_seen.weight if top_seen else 0.0
+                boost = min(maxw / 10.0, 0.15)
+            except Exception:
+                boost = 0.0
+
+            total = (
+                0.25 * name_score +
+                0.30 * genre_score +
+                0.35 * audio_score +
+                0.10 * pop_score +
+                boost
+            )
+
+            reason_bits = []
+            if name_score >= 0.7: reason_bits.append("name match")
+            if genre_score >= 0.3: reason_bits.append("genre overlap")
+            if audio_score >= 0.35: reason_bits.append("similar audio feel")
+            if pop_score >= 0.5: reason_bits.append("popular pick")
+            if boost > 0.0: reason_bits.append("seen together on posters")
+
+            results.append({
                 "candidate": cand,
                 "resolved_name": found_name,
-                "spotify_artist_id": found["id"],
+                "spotify_artist_id": artist_id,
                 "image": (found.get("images") or [{}])[0].get("url"),
                 "external_url": (found.get("external_urls") or {}).get("spotify"),
-                "genres": sorted(artist_genres)[:6],
+                "genres": sorted(artist_genres)[:4],
                 "popularity": found.get("popularity"),
                 "scores": {
-                    "name": round(name_score, 1),
-                    "genre": round(genre_score, 3),
-                    "total": round(total, 3)
-                }
+                    "name": round(100 * name_score, 1),
+                    "genre": round(100 * genre_score, 1),
+                    "audio": round(100 * audio_score, 1),
+                    "pop": round(100 * pop_score, 1),
+                    "total": round(total, 3),
+                },
+                "explanation": " + ".join(reason_bits) if reason_bits else "closest overall match",
             })
 
-        # user taste profile
-        profile = _user_profile(acct)
-        user_vec  = profile["audio_vec"]
-        user_gset = profile["genres"]
-        user_tops = profile["top_artists"]
+        # co-occurrence update + scan log
+        resolved_names = [r["resolved_name"] for r in results]
+        if resolved_names:
+            _update_cooccurrence(db, resolved_names)
+            db.add(PosterScan(
+                spotify_user_id=sid,
+                scan_ts=int(time.time()),
+                artists_csv=",".join(resolved_names)
+            ))
+            db.commit()
 
-        enriched=[]
-        for r in base_results:
-            aid = r.get("spotify_artist_id")
-            a_genres = set(r.get("genres", []))
-            a_vec = _artist_audio_vec(aid, sess, acct.access_token) if aid else []
-            sim_to_user = _sim_audio_genre(a_vec, a_genres, user_vec, user_gset) if a_vec and user_vec else 0.0
-
-            closest_name = None; closest_sim = 0.0
-            for up in user_tops:
-                if not up["audio_vec"]:
-                    continue
-                s = _sim_audio_genre(a_vec, a_genres, up["audio_vec"], up["genres"])
-                if s > closest_sim:
-                    closest_sim = s
-                    closest_name = up["name"]
-
-            name_score  = (r.get("scores", {}) or {}).get("name", 0.0) / 100.0
-            genre_score = (r.get("scores", {}) or {}).get("genre", 0.0)
-            confidence  = 0.6*name_score + 0.4*genre_score
-
-            final = 0.6 * sim_to_user + 0.4 * confidence
-
-            r["taste"] = {
-                "sim_to_user": round(sim_to_user,3),
-                "closest_user_artist": closest_name,
-                "closest_user_sim": round(closest_sim,3),
-                "final_score": round(final,3),
-                "why": [w for w in [
-                    f"closest to your '{closest_name}'" if closest_name and closest_sim>=0.45 else None,
-                    "strong text/genre match" if confidence>=0.5 else None,
-                ] if w]
-            }
-            enriched.append(r)
-
-        enriched.sort(key=lambda x: x.get("taste",{}).get("final_score",0.0), reverse=True)
-        pruned = [r for r in enriched if r.get("taste",{}).get("final_score",0.0) >= 0.35][:25]
-
-        return {
-            "count": len(pruned),
-            "items": pruned,
-            "debug": {"candidates": candidates[:40], "used_user_genres": sorted(list(user_gset))[:20]}
-        }
+        # rank & prune
+        results.sort(key=lambda x: x["scores"]["total"], reverse=True)
+        pruned = [r for r in results if r["scores"]["total"] >= 0.35][:20]
+        return {"count": len(pruned), "items": pruned, "debug": {"candidates": candidates[:30]}}
 
     # ---- Error handlers ----
     @app.errorhandler(413)
@@ -508,6 +556,7 @@ def create_app() -> Flask:
         return {"error": "server_error"}, 500
 
     return app
+
 
 app = create_app()
 
