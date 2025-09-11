@@ -1,6 +1,5 @@
-import { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import { API_BASE } from "./config";
-import CameraScan from "./CameraScan";
 
 type Artist = {
   id: string;
@@ -22,6 +21,7 @@ function useSpotifyUserId() {
   const [sid, setSid] = useState<string | null>(null);
 
   useEffect(() => {
+    // take sid from hash once after login redirect
     const hash = window.location.hash;
     const m = /sid=([^&]+)/.exec(hash);
     if (m?.[1]) {
@@ -37,15 +37,40 @@ function useSpotifyUserId() {
   return sid;
 }
 
+// Optional: compress images client-side before upload
+async function compressToJpeg(file: File, maxDim = 1600, quality = 0.9): Promise<Blob> {
+  // If it's not an image, just return the original file
+  if (!file.type.startsWith("image/")) return file;
+
+  const img = await createImageBitmap(file);
+  const scale = Math.min(1, maxDim / Math.max(img.width, img.height));
+  const w = Math.round(img.width * scale);
+  const h = Math.round(img.height * scale);
+
+  const canvas = document.createElement("canvas");
+  canvas.width = w;
+  canvas.height = h;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) throw new Error("Canvas not supported");
+  ctx.drawImage(img, 0, 0, w, h);
+
+  const blob: Blob = await new Promise((resolve, reject) =>
+    canvas.toBlob((b) => (b ? resolve(b) : reject(new Error("toBlob failed"))), "image/jpeg", quality)
+  );
+  return blob;
+}
+
 export default function App() {
   const sid = useSpotifyUserId();
+
   const [timeRange, setTimeRange] =
     useState<"short_term" | "medium_term" | "long_term">("long_term");
   const [artists, setArtists] = useState<Artist[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [file, setFile] = useState<File | null>(null);
-  const [showCamera, setShowCamera] = useState(false);
+
+  const [selFile, setSelFile] = useState<File | null>(null);
+  const [scanning, setScanning] = useState(false);
 
   const loginUrl = useMemo(() => `${API_BASE}/login`, []);
 
@@ -74,35 +99,64 @@ export default function App() {
     }
   };
 
-  const scanImage = async () => {
-    if (!sid) { alert("Link Spotify first"); return; }
-    if (!file) { alert("Choose an image"); return; }
+  const handleScan = async () => {
+    try {
+      if (!sid) {
+        alert("Connect Spotify first.");
+        return;
+      }
+      if (!selFile) {
+        alert("Please select an image.");
+        return;
+      }
 
-    const form = new FormData();
-    form.append("spotify_user_id", sid);
-    form.append("file", file);
+      setScanning(true);
 
-    const res = await fetch(`${API_BASE}/api/scan`, { method: "POST", body: form });
-    const data = await res.json();
-    if (!res.ok) {
-      alert(data?.message || "Scan failed");
-      return;
+      // Optional compression to speed uploads / avoid 413
+      const payload = await compressToJpeg(selFile, 1600, 0.9);
+
+      const form = new FormData();
+      form.append("spotify_user_id", sid);
+      form.append("file", payload, "poster.jpg");
+
+      const res = await fetch(`${API_BASE}/api/scan`, { method: "POST", body: form });
+      let data: any = null;
+      try { data = await res.json(); } catch { /* ignore */ }
+
+      if (!res.ok) {
+        const msg =
+          data?.message ||
+          (data?.error === "ocr_unavailable"
+            ? "OCR is unavailable on the server."
+            : `Scan failed (HTTP ${res.status})`);
+        alert(msg);
+        console.error("scan error:", res.status, data);
+        return;
+      }
+
+      const items: Artist[] = (data.items || []).map((x: any) => ({
+        id: x.spotify_artist_id,
+        name: x.resolved_name,
+        genres: x.genres || [],
+        image: x.image,
+        external_url: x.external_url,
+        popularity: x.popularity ?? undefined,
+        matchTotal: Math.round((x.scores?.total ?? 0) * 100),
+        nameSim: Math.round(x.scores?.name ?? 0),
+        genreSim: Math.round((x.scores?.genre ?? 0) * 100),
+        fromScan: true,
+      }));
+      items.sort((a, b) => (b.matchTotal ?? 0) - (a.matchTotal ?? 0));
+      setArtists(items);
+
+      // reset file picker for convenience
+      setSelFile(null);
+    } catch (err: any) {
+      console.error(err);
+      alert(err?.message || "Scan failed.");
+    } finally {
+      setScanning(false);
     }
-
-    const items: Artist[] = (data.items || []).map((x: any) => ({
-      id: x.spotify_artist_id,
-      name: x.resolved_name,
-      genres: x.genres || [],
-      image: x.image,
-      external_url: x.external_url,
-      popularity: x.popularity ?? undefined,                    // Spotify popularity
-      matchTotal: Math.round((x.scores?.total ?? 0) * 100),     // 0..100
-      nameSim: Math.round(x.scores?.name ?? 0),                 // 0..100
-      genreSim: Math.round((x.scores?.genre ?? 0) * 100),       // 0..100
-      fromScan: true,
-    }));
-    items.sort((a, b) => (b.matchTotal ?? 0) - (a.matchTotal ?? 0));
-    setArtists(items);
   };
 
   return (
@@ -141,31 +195,21 @@ export default function App() {
           {loading ? "Loading..." : "Load Top Artists"}
         </button>
 
-        {/* Quick mobile camera picker */}
+        {/* Upload-only scan: on mobile, this opens the camera */}
         <input
           type="file"
           accept="image/*"
           capture="environment"
-          onChange={(e) => setFile(e.target.files?.[0] || null)}
+          onChange={(e) => setSelFile(e.target.files?.[0] ?? null)}
         />
-        <button onClick={scanImage} disabled={!sid || !file}>
-          Scan image
-        </button>
-
-        {/* Live camera */}
-        <button onClick={() => setShowCamera((s) => !s)}>
-          {showCamera ? "Hide camera" : "Use camera"}
+        <button
+          onClick={handleScan}
+          disabled={!sid || !selFile || scanning}
+          title={!sid ? "Connect Spotify first" : (!selFile ? "Select an image" : "")}
+        >
+          {scanning ? "Scanning…" : "Scan image"}
         </button>
       </div>
-
-      {showCamera && sid && (
-        <div style={{ marginBottom: 16 }}>
-          <CameraScan
-            spotifyUserId={sid}
-            onResults={(items) => setArtists(items)}
-          />
-        </div>
-      )}
 
       {error && <div style={{ color: "crimson", marginBottom: 12 }}>{error}</div>}
       {!error && !loading && artists.length === 0 && (
